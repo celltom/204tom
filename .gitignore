@@ -7,7 +7,7 @@ node_modules/
 coverage/
 
 # Production
-dist/
+# dist/ - 注释掉，GitHub Actions 需要 dist 目录
 build/
 
 # Misc
