@@ -6,13 +6,13 @@ import { getFirestore } from 'firebase/firestore';
 
 // Your web app's Firebase configuration
 const firebaseConfig = {
-  apiKey: "AIzaSyATS8YGzMcuBMEumNsNLgj7jMmCU7tfzKY",
-  authDomain: "myclouddisk-5da65.firebaseapp.com",
-  projectId: "myclouddisk-5da65",
-  storageBucket: "myclouddisk-5da65.firebasestorage.app",
-  messagingSenderId: "266411094712",
-  appId: "1:266411094712:web:64e7e8db468ffba77e3a4d",
-  measurementId: "G-DYLWFM3NX4"
+  apiKey: "AIzaSyAufVyStM1-sgdTJsX6NdNeN9AeoCRIX6A",
+  authDomain: "myclouddisk-710ef.firebaseapp.com",
+  projectId: "myclouddisk-710ef",
+  storageBucket: "myclouddisk-710ef.firebasestorage.app",
+  messagingSenderId: "447065670060",
+  appId: "1:447065670060:web:bd4745dd3ce9f63ceefa09",
+  measurementId: "G-9HGZH94W2H"
 };
 
 // Initialize Firebase
@@ -46,7 +46,7 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 
 // App ID for Firestore collection structure
-const appId = 'myclouddisk-5da65';
+const appId = 'myclouddisk-710ef';
 
 export { app, auth, db, appId, analytics };
 
