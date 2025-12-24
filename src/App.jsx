@@ -17,29 +17,14 @@ import {
   AlertCircle
 } from 'lucide-react';
 
-// --- Firebase Imports ---
-import { 
-  signInAnonymously, 
-  onAuthStateChanged,
-  signInWithCustomToken
-} from 'firebase/auth';
-import { 
-  collection, 
-  addDoc, 
-  onSnapshot, 
-  doc, 
-  serverTimestamp,
-  query,
-  where,
-  getDocs,
-  writeBatch
-} from 'firebase/firestore';
-import { auth, db, appId } from './firebase';
+// --- LeanCloud Imports ---
+import AV from './leancloud';
 
 // --- Constants ---
-// Firestore 每个文档最大 1MB，这里将单块控制在 200KB，留出字段开销
-const CHUNK_SIZE = 200 * 1024; // 200KB per chunk
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB Limit
+// 150KB 原文件大小 per chunk (base64 后约 200KB)
+const CHUNK_SIZE = 150 * 1024;
+const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+const LC_APP_ID = 'myclouddisk-710ef'; // 用于隔离数据
 
 // --- Utility Functions ---
 const formatBytes = (bytes, decimals = 2) => {
@@ -53,8 +38,8 @@ const formatBytes = (bytes, decimals = 2) => {
 
 const getFileIcon = (mimeType = '', name = '') => {
   const lowerName = name.toLowerCase();
-  if (mimeType.includes('image')) return <ImageIcon className="w-8 h-8 text-purple-500" />;
-  if (mimeType.includes('pdf')) return <FileText className="w-8 h-8 text-red-500" />;
+  if (mimeType?.includes('image')) return <ImageIcon className="w-8 h-8 text-purple-500" />;
+  if (mimeType?.includes('pdf')) return <FileText className="w-8 h-8 text-red-500" />;
   if (lowerName.endsWith('.ppt') || lowerName.endsWith('.pptx')) return <Presentation className="w-8 h-8 text-orange-500" />;
   if (lowerName.endsWith('.doc') || lowerName.endsWith('.docx')) return <FileText className="w-8 h-8 text-blue-500" />;
   return <File className="w-8 h-8 text-gray-500" />;
@@ -73,6 +58,7 @@ export default function App() {
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadingFileId, setDownloadingFileId] = useState(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [isLoadingItems, setIsLoadingItems] = useState(false);
   
   // Modal States
   const [showNewFolderModal, setShowNewFolderModal] = useState(false);
@@ -80,83 +66,70 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
 
-  // 1. Auth Initialization
-  useEffect(() => {
-    let timeoutId;
-    let unsubscribe;
-    let isMounted = true;
-    
-    const initAuth = async () => {
-      try {
-        // 设置超时，10秒后如果还没登录成功就显示错误
-        timeoutId = setTimeout(() => {
-          if (isMounted) {
-            setErrorMsg("连接超时。请检查：1) Firebase 匿名登录已启用 2) 网络连接正常 3) Firestore 规则已配置");
-          }
-        }, 10000);
+  const createPublicACL = () => {
+    const acl = new AV.ACL();
+    acl.setPublicReadAccess(true);
+    acl.setPublicWriteAccess(true);
+    return acl;
+  };
 
-        await signInAnonymously(auth);
-        console.log("匿名登录成功");
-        if (isMounted) {
-          clearTimeout(timeoutId);
+  // 1. Auth Initialization (匿名登录)
+  useEffect(() => {
+    let mounted = true;
+    const login = async () => {
+      try {
+        const current = AV.User.current();
+        if (current) {
+          if (mounted) setUser(current);
+          return;
         }
+        const anon = await AV.User.loginAnonymously();
+        if (mounted) setUser(anon);
+        console.log('匿名登录成功', anon.id);
       } catch (err) {
-        console.error("Auth failed:", err);
-        if (isMounted) {
-          clearTimeout(timeoutId);
-          if (err.code === 'auth/operation-not-allowed') {
-            setErrorMsg("Firebase 匿名登录未启用。请在 Firebase Console 的 Authentication 中启用 Anonymous 登录方式。");
-          } else {
-            setErrorMsg(`登录失败: ${err.message || err.code || '未知错误'}。请检查 Firebase 配置和网络连接。`);
-          }
-        }
+        console.error('LeanCloud 匿名登录失败:', err);
+        if (mounted) setErrorMsg(`登录失败：${err.message || err.code || '未知错误'}`);
       }
     };
-    
-    initAuth();
-    unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      if (currentUser) {
-        clearTimeout(timeoutId);
-        console.log("用户已登录:", currentUser.uid);
-      }
-      if (isMounted) {
-        setUser(currentUser);
-      }
-    });
-    
-    return () => {
-      isMounted = false;
-      clearTimeout(timeoutId);
-      if (unsubscribe) unsubscribe();
-    };
+    login();
+    return () => { mounted = false; };
   }, []);
 
-  // 2. Data Fetching
+  // 2. Data Fetching（轮询）
   useEffect(() => {
     if (!user) return;
-
-    const q = collection(db, 'artifacts', appId, 'public', 'data', 'files');
-    
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const loadedItems = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
-      
-      const visibleItems = loadedItems.filter(item => item.type === 'folder' || item.type === 'file');
-
-      visibleItems.sort((a, b) => {
-        if (a.type === 'folder' && b.type !== 'folder') return -1;
-        if (a.type !== 'folder' && b.type === 'folder') return 1;
-        return (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0);
-      });
-      setItems(visibleItems);
-    }, (error) => {
-      console.error("Data fetch error:", error);
-      setErrorMsg("无法加载文件，请检查网络。");
-    });
-
-    return () => unsubscribe();
+    let timer;
+    const fetchItems = async () => {
+      try {
+        setIsLoadingItems(true);
+        const query = new AV.Query('Files');
+        query.equalTo('appId', LC_APP_ID);
+        query.notEqualTo('type', 'chunk');
+        query.addDescending('createdAt');
+        query.limit(1000);
+        const res = await query.find();
+        const loadedItems = res.map(obj => ({
+          id: obj.id,
+          ...obj.toJSON()
+        }));
+        loadedItems.sort((a, b) => {
+          if (a.type === 'folder' && b.type !== 'folder') return -1;
+          if (a.type !== 'folder' && b.type === 'folder') return 1;
+          return (new Date(b.createdAt).getTime()) - (new Date(a.createdAt).getTime());
+        });
+        setItems(loadedItems);
+        setIsLoadingItems(false);
+      } catch (err) {
+        console.error('Data fetch error:', err);
+        setErrorMsg('无法加载文件，请检查网络。');
+        setIsLoadingItems(false);
+      }
+    };
+    fetchItems();
+    timer = setInterval(fetchItems, 3000);
+    return () => {
+      if (timer) clearInterval(timer);
+    };
   }, [user]);
 
   // 3. Filter Items for Current Folder View
@@ -179,23 +152,21 @@ export default function App() {
   const handleCreateFolder = async () => {
     if (!newFolderName.trim()) return;
     try {
-      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'files'), {
-        name: newFolderName,
-        type: 'folder',
-        parentId: currentFolderId,
-        ownerId: user.uid,
-        createdAt: serverTimestamp()
-      });
+      const FolderObj = AV.Object.extend('Files');
+      const folder = new FolderObj();
+      folder.set('name', newFolderName);
+      folder.set('type', 'folder');
+      folder.set('parentId', currentFolderId);
+      folder.set('ownerId', user?.id || 'anonymous');
+      folder.set('appId', LC_APP_ID);
+      folder.setACL(createPublicACL());
+      await folder.save();
       setNewFolderName('');
       setShowNewFolderModal(false);
       showMessage("文件夹创建成功");
     } catch (err) {
       console.error(err);
-      if (err.code === 'permission-denied') {
-        showMessage("创建文件夹失败：Firestore 权限不足，请检查规则。", true);
-      } else {
-        showMessage("创建文件夹失败", true);
-      }
+      showMessage("创建文件夹失败", true);
     }
   };
 
@@ -204,70 +175,120 @@ export default function App() {
     if (!file) return;
 
     if (file.size > MAX_FILE_SIZE) {
-      showMessage(`文件过大！支持最大 10MB。\n您的文件: ${formatBytes(file.size)}`, true);
+      showMessage(`文件过大！支持最大 ${formatBytes(MAX_FILE_SIZE)}。\n您的文件: ${formatBytes(file.size)}`, true);
       return;
     }
 
     setIsUploading(true);
     setUploadProgress(0);
+    setErrorMsg(''); // 清除之前的错误
 
     const reader = new FileReader();
     reader.onload = async (event) => {
-      const base64Full = event.target.result;
-      const totalLength = base64Full.length;
-      
-      const chunks = [];
-      for (let i = 0; i < totalLength; i += CHUNK_SIZE) {
-        chunks.push(base64Full.substring(i, i + CHUNK_SIZE));
-      }
-
       try {
-        const fileDocRef = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'files'), {
-          name: file.name,
-          type: 'file',
-          size: file.size,
-          mimeType: file.type,
-          parentId: currentFolderId,
-          ownerId: user.uid,
-          chunkCount: chunks.length,
-          createdAt: serverTimestamp()
-        });
-
-        for (let i = 0; i < chunks.length; i++) {
-          await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'files'), {
-            type: 'chunk',
-            parentFileId: fileDocRef.id, 
-            index: i,
-            data: chunks[i],
-            ownerId: user.uid
-          });
-          setUploadProgress(Math.round(((i + 1) / chunks.length) * 100));
+        const base64Full = event.target.result;
+        const totalLength = base64Full.length;
+        
+        console.log(`文件: ${file.name}, 大小: ${formatBytes(file.size)}, Base64长度: ${totalLength}`);
+        
+        // 计算分片数量（基于base64字符串长度）
+        const chunks = [];
+        for (let i = 0; i < totalLength; i += CHUNK_SIZE) {
+          chunks.push(base64Full.substring(i, i + CHUNK_SIZE));
         }
 
+        console.log(`分片数量: ${chunks.length}, 每个分片约: ${formatBytes(CHUNK_SIZE)}`);
+
+        // 设置超时检测
+        let uploadCompleted = false;
+        const uploadTimeout = setTimeout(() => {
+          if (!uploadCompleted) {
+            console.error("上传超时");
+            showMessage("上传超时，请检查网络连接或尝试更小的文件。", true);
+            setIsUploading(false);
+            setUploadProgress(0);
+          }
+        }, 60000); // 60秒超时
+
+        // 1. 先创建文件元数据
+        console.log("创建文件元数据...");
+        const FileObj = AV.Object.extend('Files');
+        const fileObj = new FileObj();
+        fileObj.set('name', file.name);
+        fileObj.set('type', 'file');
+        fileObj.set('size', file.size);
+        fileObj.set('mimeType', file.type);
+        fileObj.set('parentId', currentFolderId);
+        fileObj.set('ownerId', user?.id || 'anonymous');
+        fileObj.set('chunkCount', chunks.length);
+        fileObj.set('appId', LC_APP_ID);
+        fileObj.setACL(createPublicACL());
+        const fileDocRef = await fileObj.save();
+        console.log("文件元数据创建成功:", fileDocRef.id);
+
+        // 2. 上传分片
+        console.log("开始上传分片...");
+        for (let i = 0; i < chunks.length; i++) {
+          try {
+            console.log(`上传分片 ${i + 1}/${chunks.length}...`);
+            const ChunkObj = AV.Object.extend('Files');
+            const chunkObj = new ChunkObj();
+            chunkObj.set('type', 'chunk');
+            chunkObj.set('parentFileId', fileDocRef.id);
+            chunkObj.set('index', i);
+            chunkObj.set('data', chunks[i]);
+            chunkObj.set('ownerId', user?.id || 'anonymous');
+            chunkObj.set('appId', LC_APP_ID);
+            chunkObj.setACL(createPublicACL());
+            await chunkObj.save();
+            const progress = Math.round(((i + 1) / chunks.length) * 100);
+            setUploadProgress(progress);
+            console.log(`分片 ${i + 1} 上传成功，进度: ${progress}%`);
+          } catch (chunkErr) {
+            console.error(`分片 ${i + 1} 上传失败:`, chunkErr);
+            throw new Error(`分片 ${i + 1} 上传失败: ${chunkErr.message || chunkErr.code || '未知错误'}`);
+          }
+        }
+
+        uploadCompleted = true;
+        clearTimeout(uploadTimeout);
         setIsUploading(false);
         setUploadProgress(0);
-        showMessage("上传成功");
+        showMessage("上传成功！");
         // Reset file input
         e.target.value = '';
+        console.log("文件上传完成");
       } catch (err) {
+        uploadCompleted = true;
+        clearTimeout(uploadTimeout);
+        
         console.error("Upload error:", err);
-        if (err.code === 'permission-denied') {
-          showMessage("上传失败：Firestore 权限不足，请检查安全规则和登录状态。", true);
-        } else if (err.code === 'resource-exhausted') {
-          showMessage("上传失败：单文件写入过大，请尝试更小的文件或降低分片大小。", true);
+        console.error("Error details:", {
+          code: err.code,
+          message: err.message,
+          stack: err.stack
+        });
+        
+        let errorMsg = "上传失败";
+        if (err.message) {
+          errorMsg = `上传失败：${err.message}`;
         } else {
-          showMessage("上传失败，请重试。", true);
+          errorMsg = `上传失败：${err.code || '未知错误'}。请检查浏览器控制台（F12）查看详细信息。`;
         }
+        
+        showMessage(errorMsg, true);
         setIsUploading(false);
         setUploadProgress(0);
       }
     };
 
     reader.onerror = () => {
-      showMessage("读取文件失败", true);
+      console.error("FileReader error");
+      showMessage("读取文件失败，请重试。", true);
       setIsUploading(false);
       setUploadProgress(0);
     };
+    
     reader.readAsDataURL(file);
   };
 
@@ -277,15 +298,14 @@ export default function App() {
     setDownloadingFileId(fileItem.id);
 
     try {
-      const q = query(
-        collection(db, 'artifacts', appId, 'public', 'data', 'files'), 
-        where('parentFileId', '==', fileItem.id),
-        where('type', '==', 'chunk')
-      );
+      const chunkQuery = new AV.Query('Files');
+      chunkQuery.equalTo('appId', LC_APP_ID);
+      chunkQuery.equalTo('parentFileId', fileItem.id);
+      chunkQuery.equalTo('type', 'chunk');
+      chunkQuery.ascending('index');
+      const snapshot = await chunkQuery.find();
       
-      const snapshot = await getDocs(q);
-      
-      if (snapshot.empty) {
+      if (snapshot.length === 0) {
         if (fileItem.data) {
            triggerDownload(fileItem.data, fileItem.name);
         } else {
@@ -296,7 +316,7 @@ export default function App() {
         return;
       }
 
-      const chunks = snapshot.docs.map(d => d.data());
+      const chunks = snapshot.map(d => d.toJSON());
       chunks.sort((a, b) => a.index - b.index);
 
       const fullBase64 = chunks.map(c => c.data).join('');
@@ -309,11 +329,7 @@ export default function App() {
 
     } catch (err) {
       console.error("Download error:", err);
-      if (err.code === 'permission-denied') {
-        showMessage("下载失败：Firestore 权限不足，请检查规则。", true);
-      } else {
-        showMessage("下载失败，请刷新重试。", true);
-      }
+      showMessage("下载失败，请刷新重试。", true);
     } finally {
       setIsDownloading(false);
       setDownloadingFileId(null);
@@ -330,8 +346,7 @@ export default function App() {
   };
 
   const handleDelete = async (item) => {
-    // Permission check warning (optional: you can remove this if you want total freedom)
-    if (item.ownerId && user && item.ownerId !== user.uid) {
+    if (item.ownerId && user && item.ownerId !== user.id) {
        if (!confirm("这不是您的文件。确定要强制删除吗？")) return;
     } else {
        if (!confirm(`确定要删除 "${item.name}" 吗？此操作不可恢复。`)) return;
@@ -340,45 +355,33 @@ export default function App() {
     setIsDeleting(true);
 
     try {
-      const batch = writeBatch(db);
-      const collectionRef = collection(db, 'artifacts', appId, 'public', 'data', 'files');
+      // 删除自身
+      const itemObj = AV.Object.createWithoutData('Files', item.id);
+      await itemObj.destroy();
 
-      // 1. Delete the item itself
-      const itemRef = doc(db, 'artifacts', appId, 'public', 'data', 'files', item.id);
-      batch.delete(itemRef);
-
-      // 2. If it's a file, delete all its chunks
       if (item.type === 'file') {
-        const qChunks = query(collectionRef, where('parentFileId', '==', item.id));
-        const chunkSnapshot = await getDocs(qChunks);
-        chunkSnapshot.forEach(doc => {
-          batch.delete(doc.ref);
-        });
+        // 删除分片
+        const qChunks = new AV.Query('Files');
+        qChunks.equalTo('appId', LC_APP_ID);
+        qChunks.equalTo('parentFileId', item.id);
+        const chunkSnapshot = await qChunks.find();
+        await AV.Object.destroyAll(chunkSnapshot);
       }
 
-      // 3. If it's a folder, delete its direct children (files/folders) 
-      // Note: This is a shallow delete for one level. Deep recursive delete is complex in client-side only.
       if (item.type === 'folder') {
-        const qChildren = query(collectionRef, where('parentId', '==', item.id));
-        const childrenSnapshot = await getDocs(qChildren);
-        
-        // We need to fetch chunks for any files inside this folder too to keep DB clean
-        // This simple implementation deletes the file docs, rendering chunks orphaned (which is acceptable for simple demo)
-        childrenSnapshot.forEach(doc => {
-          batch.delete(doc.ref);
-        });
+        // 删除直接子节点（浅层）
+        const qChildren = new AV.Query('Files');
+        qChildren.equalTo('appId', LC_APP_ID);
+        qChildren.equalTo('parentId', item.id);
+        const childrenSnapshot = await qChildren.find();
+        await AV.Object.destroyAll(childrenSnapshot);
       }
 
-      await batch.commit();
       showMessage("删除成功");
 
     } catch (err) {
       console.error("Delete error:", err);
-      if (err.code === 'permission-denied') {
-        showMessage("无法删除：权限不足。您只能删除自己上传的文件。", true);
-      } else {
-        showMessage("删除失败，请刷新后重试。", true);
-      }
+      showMessage("删除失败，请刷新后重试。", true);
     } finally {
       setIsDeleting(false);
     }
@@ -444,7 +447,7 @@ export default function App() {
         <div className="flex items-center space-x-4 text-sm">
           <div className="hidden md:flex items-center opacity-90">
              <User size={16} className="mr-1"/> 
-             用户: {user.uid.slice(0, 6)}...
+             用户: {user?.id?.slice(0, 6)}...
           </div>
         </div>
       </div>
