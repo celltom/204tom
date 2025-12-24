@@ -37,7 +37,8 @@ import {
 import { auth, db, appId } from './firebase';
 
 // --- Constants ---
-const CHUNK_SIZE = 600 * 1024; // 600KB per chunk
+// Firestore 每个文档最大 1MB，这里将单块控制在 200KB，留出字段开销
+const CHUNK_SIZE = 200 * 1024; // 200KB per chunk
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB Limit
 
 // --- Utility Functions ---
@@ -190,7 +191,11 @@ export default function App() {
       showMessage("文件夹创建成功");
     } catch (err) {
       console.error(err);
-      showMessage("创建文件夹失败", true);
+      if (err.code === 'permission-denied') {
+        showMessage("创建文件夹失败：Firestore 权限不足，请检查规则。", true);
+      } else {
+        showMessage("创建文件夹失败", true);
+      }
     }
   };
 
@@ -246,14 +251,22 @@ export default function App() {
         e.target.value = '';
       } catch (err) {
         console.error("Upload error:", err);
-        showMessage("上传失败，请重试。", true);
+        if (err.code === 'permission-denied') {
+          showMessage("上传失败：Firestore 权限不足，请检查安全规则和登录状态。", true);
+        } else if (err.code === 'resource-exhausted') {
+          showMessage("上传失败：单文件写入过大，请尝试更小的文件或降低分片大小。", true);
+        } else {
+          showMessage("上传失败，请重试。", true);
+        }
         setIsUploading(false);
+        setUploadProgress(0);
       }
     };
 
     reader.onerror = () => {
       showMessage("读取文件失败", true);
       setIsUploading(false);
+      setUploadProgress(0);
     };
     reader.readAsDataURL(file);
   };
@@ -287,12 +300,20 @@ export default function App() {
       chunks.sort((a, b) => a.index - b.index);
 
       const fullBase64 = chunks.map(c => c.data).join('');
-      triggerDownload(fullBase64, fileItem.name);
-      showMessage("下载成功");
+      if (!fullBase64) {
+        showMessage("文件数据为空，无法下载。", true);
+      } else {
+        triggerDownload(fullBase64, fileItem.name);
+        showMessage("下载成功");
+      }
 
     } catch (err) {
       console.error("Download error:", err);
-      showMessage("下载失败，请刷新重试。", true);
+      if (err.code === 'permission-denied') {
+        showMessage("下载失败：Firestore 权限不足，请检查规则。", true);
+      } else {
+        showMessage("下载失败，请刷新重试。", true);
+      }
     } finally {
       setIsDownloading(false);
       setDownloadingFileId(null);
